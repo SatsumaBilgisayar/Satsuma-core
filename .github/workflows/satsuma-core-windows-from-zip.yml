@@ -3,7 +3,7 @@ name: Satsuma Windows build (core-yamali + lineage patch)
 on:
   push:
     branches: [build/windows-yamali-20261126]
-    paths: [core-yamali.zip]
+    paths: [core-yamali.zip, .github/workflows/satsuma-core-windows-from-zip.yml]
   workflow_dispatch:
 
 permissions:
