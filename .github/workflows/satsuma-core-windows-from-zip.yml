@@ -1,0 +1,110 @@
+name: Satsuma Windows build (core-yamali + lineage patch)
+
+on:
+  push:
+    branches: [build/windows-yamali-20261126]
+    paths: [core-yamali.zip]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check source archive
+        shell: pwsh
+        run: |
+          if (-not (Test-Path core-yamali.zip)) { throw 'core-yamali.zip is missing from the branch root' }
+          $hash = (Get-FileHash core-yamali.zip -Algorithm SHA256).Hash.ToLower()
+          "core-yamali.zip SHA256=$hash"
+          Expand-Archive -LiteralPath core-yamali.zip -DestinationPath $env:RUNNER_TEMP\satsuma-source -Force
+          if (-not (Test-Path "$env:RUNNER_TEMP\satsuma-source\satsuma-core-windows\satsuma_core_windows.py")) {
+            throw 'Expected satsuma-core-windows source folder is missing from archive'
+          }
+          if (-not (Select-String -Path "$env:RUNNER_TEMP\satsuma-source\satsuma-core-windows\satsuma_win\lineage.py" -Pattern 'NEVER_TARGETS' -Quiet)) {
+            throw 'Lineage hardening patch is not present in core-yamali.zip'
+          }
+          Remove-Item satsuma-core-windows -Recurse -Force
+          Copy-Item "$env:RUNNER_TEMP\satsuma-source\satsuma-core-windows" . -Recurse
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install build and test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check -r satsuma-core-windows/requirements.txt
+          python -m pip install "pywin32>=306" "pytest>=8,<9" "pytest-timeout>=2,<3" "pyinstaller>=6.10,<7" "PyQt6>=6.7"
+
+      - name: Embed approved Linux panel theme
+        working-directory: satsuma-core-windows
+        run: python proof/embed_linux_theme.py
+
+      - name: Run source tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}\satsuma-core-windows;${{ github.workspace }}
+        run: python -m pytest -v -p no:cacheprovider --timeout 120 --timeout-method thread satsuma-core-windows/tests
+
+      - name: Build core executable
+        working-directory: satsuma-core-windows
+        run: >
+          python -m PyInstaller --onefile --console --uac-admin --clean --noconfirm
+          --name satsuma-core-windows --paths . --paths ..
+          --hidden-import satsuma.peer_watch --hidden-import satsuma.procnet
+          --hidden-import satsuma.memory_decision --hidden-import satsuma.enforcement
+          --hidden-import satsuma.device_policy --hidden-import satsuma.gateway_decision
+          --hidden-import satsuma.dns_encrypted --hidden-import satsuma.ai_guard
+          --hidden-import satsuma.browser_policy --hidden-import satsuma.deepseek_client
+          --hidden-import satsuma.rule_schema --hidden-import satsuma.suricata_config
+          --hidden-import satsuma.ram.engine --hidden-import satsuma.ram.proc
+          --hidden-import satsuma_win.machine_key --hidden-import satsuma_win.sysmon
+          --hidden-import satsuma_win.gateway --hidden-import satsuma_win.accounts
+          --hidden-import satsuma_win.devices --hidden-import satsuma_win.winservice
+          --hidden-import satsuma_win.clamav --hidden-import satsuma_win.ramscan
+          --hidden-import win32crypt --hidden-import win32evtlog --hidden-import win32timezone
+          --hidden-import win32job --hidden-import win32api
+          --add-data "rules;rules"
+          --add-data "../rules/ram_defense.yaml;rules"
+          --add-data "../rules/memory_injection.yaml;rules"
+          --add-data "../rules/memory_integrity.yaml;rules"
+          satsuma_core_windows.py
+
+      - name: Build panel executable
+        working-directory: satsuma-core-windows
+        run: >
+          python -m PyInstaller --onefile --windowed --clean --noconfirm
+          --name satsuma-panel --paths . --paths ..
+          --collect-all PyQt6
+          satsuma_panel.py
+
+      - name: Smoke test and checksums
+        shell: pwsh
+        run: |
+          $core = "satsuma-core-windows\dist\satsuma-core-windows.exe"
+          $panel = "satsuma-core-windows\dist\satsuma-panel.exe"
+          if (-not (Test-Path $core)) { throw 'Core EXE was not produced' }
+          if (-not (Test-Path $panel)) { throw 'Panel EXE was not produced' }
+          $report = & $core --memory-report | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "Core EXE smoke test failed: $report" }
+          $report | Set-Content -Encoding utf8 satsuma-core-windows\dist\memory-report.json
+          Push-Location satsuma-core-windows\dist
+          Get-FileHash satsuma-core-windows.exe,satsuma-panel.exe -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $($_.Path | Split-Path -Leaf)" } |
+            Set-Content -Encoding ascii SHA256SUMS
+          Get-Content SHA256SUMS
+          Compress-Archive -Path satsuma-core-windows.exe,satsuma-panel.exe,SHA256SUMS,memory-report.json -DestinationPath Satsuma-Windows-EXE.zip -Force
+          Pop-Location
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Satsuma-Windows-EXE-yamali
+          path: satsuma-core-windows/dist/Satsuma-Windows-EXE.zip
+          if-no-files-found: error
+          retention-days: 30
